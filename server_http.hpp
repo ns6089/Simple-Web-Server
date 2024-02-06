@@ -227,16 +227,15 @@ namespace SimpleWeb {
       friend class Server<socket_type>;
       friend class Session;
 
-      asio::streambuf streambuf;
+      std::unique_ptr<asio::streambuf> streambuf;
       asio::streambuf content_streambuf;
       std::weak_ptr<Connection> connection;
       std::string optimization = std::to_string(0); // TODO: figure out what goes wrong in gcc optimization without this line
 
       Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_) noexcept
-          : streambuf(max_request_streambuf_size), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {}
-      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, asio::streambuf &&pending) noexcept
-          : streambuf(max_request_streambuf_size), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {
-        std::ostream(&streambuf) << &pending;
+          : streambuf(new asio::streambuf(max_request_streambuf_size)), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {}
+      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf) noexcept
+          : streambuf(std::move(previous_streambuf)), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {
       }
 
     public:
@@ -353,9 +352,10 @@ namespace SimpleWeb {
 
     class Session {
     public:
-      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_) noexcept : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection)) {}
-      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_, asio::streambuf &&s) noexcept
-          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection, std::move(s))) {}
+      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_) noexcept
+          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection)) {}
+      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf) noexcept
+          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection, std::move(previous_streambuf))) {}
 
       std::shared_ptr<Connection> connection;
       std::shared_ptr<Request> request;
@@ -566,7 +566,7 @@ namespace SimpleWeb {
 
     void read(const std::shared_ptr<Session> &session) {
       session->connection->set_timeout(config.timeout_request);
-      asio::async_read_until(*session->connection->socket, session->request->streambuf, "\r\n\r\n", [this, session](const error_code &ec, std::size_t bytes_transferred) {
+      asio::async_read_until(*session->connection->socket, *session->request->streambuf, "\r\n\r\n", [this, session](const error_code &ec, std::size_t bytes_transferred) {
         auto lock = session->connection->handler_runner->continue_lock();
         if(!lock)
           return;
@@ -574,13 +574,13 @@ namespace SimpleWeb {
 
         if(!ec) {
           session->connection->set_timeout(this->config.timeout_content);
-          // request->streambuf.size() is not necessarily the same as bytes_transferred, from Boost-docs:
+          // request->streambuf->size() is not necessarily the same as bytes_transferred, from Boost-docs:
           // "After a successful async_read_until operation, the streambuf may contain additional data beyond the delimiter"
           // The chosen solution is to extract lines from the stream directly when parsing the header. What is left of the
           // streambuf (maybe some bytes of the content) is appended to in the async_read-function below (for retrieving content).
-          std::size_t num_additional_bytes = session->request->streambuf.size() - bytes_transferred;
+          std::size_t num_additional_bytes = session->request->streambuf->size() - bytes_transferred;
 
-          std::istream istream(&session->request->streambuf);
+          std::istream istream(session->request->streambuf.get());
           if(!RequestMessage::parse(istream, session->request->method, session->request->path,
                                     session->request->query_string, session->request->http_version, session->request->header)) {
             if(this->on_error)
@@ -600,7 +600,7 @@ namespace SimpleWeb {
                 this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
               return;
             }
-            if(content_length > session->request->streambuf.max_size()) {
+            if(content_length > session->request->streambuf->max_size()) {
               auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
               response->write(StatusCode::client_error_payload_too_large);
               if(this->on_error)
@@ -610,7 +610,7 @@ namespace SimpleWeb {
 
             if(num_additional_bytes > 0) {
               auto content_bytes = std::min<std::size_t>(content_length, (unsigned long long)num_additional_bytes);
-              auto &source = session->request->streambuf;
+              auto &source = *session->request->streambuf;
               auto &target = session->request->content_streambuf;
               target.commit(asio::buffer_copy(target.prepare(content_bytes), source.data(), content_bytes));
               source.consume(content_bytes);
@@ -634,10 +634,10 @@ namespace SimpleWeb {
           }
           else if((header_it = session->request->header.find("Transfer-Encoding")) != session->request->header.end() && header_it->second == "chunked") {
             // Expect hex number to not exceed 16 bytes (64-bit number), but take into account previous additional read bytes
-            auto chunk_size_streambuf = std::make_shared<asio::streambuf>(std::max<std::size_t>(16 + 2, session->request->streambuf.size()));
+            auto chunk_size_streambuf = std::make_shared<asio::streambuf>(std::max<std::size_t>(16 + 2, session->request->streambuf->size()));
 
             // Move leftover bytes
-            auto &source = session->request->streambuf;
+            auto &source = *session->request->streambuf;
             auto &target = *chunk_size_streambuf;
             target.commit(asio::buffer_copy(target.prepare(source.size()), source.data()));
             source.consume(source.size());
@@ -681,15 +681,19 @@ namespace SimpleWeb {
             return;
           }
 
-          auto next_step = [this, chunk_size](const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &chunk_size_streambuf) {
+          auto read_next = [this, chunk_size](const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &chunk_size_streambuf) {
             if(chunk_size == 0) {
-              // remaining bytes are the beginning of the next request
-              std::istream(chunk_size_streambuf.get()) >> &session->request->streambuf;
+              if(chunk_size_streambuf->size() > 0) {
+                // Remaining bytes are the beginning of the next request
+                auto &source = *chunk_size_streambuf;
+                auto &target = *session->request->streambuf;
+                target.commit(asio::buffer_copy(target.prepare(chunk_size_streambuf->size()), source.data(), chunk_size_streambuf->size()));
+                source.consume(chunk_size_streambuf->size());
+              }
               this->find_resource(session);
             }
-            else {
+            else
               this->read_chunked_transfer_encoded(session, chunk_size_streambuf);
-            }
           };
 
           auto num_additional_bytes = chunk_size_streambuf->size() - bytes_transferred;
@@ -704,7 +708,7 @@ namespace SimpleWeb {
           }
 
           if(chunk_size > num_additional_bytes) {
-            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, next_step](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
@@ -712,12 +716,12 @@ namespace SimpleWeb {
               if(!ec) {
                 // Remove "\r\n"
                 auto null_buffer = std::make_shared<asio::streambuf>(2);
-                asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2), [this, session, chunk_size_streambuf, null_buffer, next_step](const error_code &ec, size_t /*bytes_transferred*/) {
+                asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
                   auto lock = session->connection->handler_runner->continue_lock();
                   if(!lock)
                     return;
                   if(!ec)
-                    next_step(session, chunk_size_streambuf);
+                    read_next(session, chunk_size_streambuf);
                   else
                     this->on_error(session->request, ec);
                 });
@@ -731,12 +735,12 @@ namespace SimpleWeb {
             if(2 + chunk_size - num_additional_bytes == 1)
               istream.get();
             auto null_buffer = std::make_shared<asio::streambuf>(2);
-            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, null_buffer, next_step](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
               if(!ec)
-                next_step(session, chunk_size_streambuf);
+                read_next(session, chunk_size_streambuf);
               else
                 this->on_error(session->request, ec);
             });
@@ -746,7 +750,7 @@ namespace SimpleWeb {
             istream.get();
             istream.get();
 
-            next_step(session, chunk_size_streambuf);
+            read_next(session, chunk_size_streambuf);
           }
         }
         else if(this->on_error)
