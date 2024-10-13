@@ -251,6 +251,10 @@ namespace SimpleWeb {
       /// The time point when the request header was fully read.
       std::chrono::system_clock::time_point header_read_time;
 
+      std::weak_ptr<Connection> get_connection() noexcept {
+        return connection;
+      }
+
       asio::ip::tcp::endpoint remote_endpoint() const noexcept {
         try {
           if(auto connection = this->connection.lock())
