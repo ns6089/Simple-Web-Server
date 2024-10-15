@@ -277,7 +277,9 @@ namespace SimpleWeb {
 
           std::size_t protocol_end;
           if((protocol_end = line.find('/', path_and_query_string_end + 1)) != std::string::npos) {
-            if(line.compare(path_and_query_string_end + 1, protocol_end - path_and_query_string_end - 1, "HTTP") != 0)
+            std::string_view protocol_name(line.data() + path_and_query_string_end + 1,
+                                           protocol_end - path_and_query_string_end - 1);
+            if(protocol_name != "HTTP" && protocol_name != "RTSP")
               return false;
             version = line.substr(protocol_end + 1, line.size() - protocol_end - 2);
           }
