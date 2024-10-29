@@ -153,6 +153,21 @@ namespace SimpleWeb {
           send_from_queue();
       }
 
+      void write_rtsp(const CaseInsensitiveMultimap &request_header,
+                      CaseInsensitiveMultimap response_header = {},
+                      string_view content = {}) {
+        auto cseq_it = request_header.find("CSeq");
+        if (cseq_it == request_header.end()) return;
+
+        *this << "RTSP/1.0 200 OK\r\n";
+
+        response_header.emplace(*cseq_it);
+        write_header(response_header, content.size());
+
+        if(!content.empty())
+          *this << content;
+      }
+
       /// Write directly to stream buffer using std::ostream::write.
       void write(const char_type *ptr, std::streamsize n) {
         std::ostream::write(ptr, n);
