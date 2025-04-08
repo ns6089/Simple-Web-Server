@@ -27,6 +27,9 @@ namespace SimpleWeb {
 #endif
 
 namespace SimpleWeb {
+  class ml_http_rtsp_server;
+  class ml_https_server;
+
   template <class socket_type>
   class Server;
 
@@ -241,6 +244,8 @@ namespace SimpleWeb {
       friend class ServerBase<socket_type>;
       friend class Server<socket_type>;
       friend class Session;
+      friend class ml_http_rtsp_server;
+      friend class ml_https_server;
 
       std::unique_ptr<asio::streambuf> streambuf;
       asio::streambuf content_streambuf;
@@ -255,6 +260,8 @@ namespace SimpleWeb {
 
     public:
       std::string method, path, query_string, http_version;
+
+      std::string moonlight_client_id;
 
       Content content;
 
@@ -583,9 +590,10 @@ namespace SimpleWeb {
       return connection;
     }
 
-    void read(const std::shared_ptr<Session> &session) {
+    virtual void read(const std::shared_ptr<Session> &session) {
       session->connection->set_timeout(config.timeout_request);
-      asio::async_read_until(*session->connection->socket, *session->request->streambuf, "\r\n\r\n", [this, session](const error_code &ec, std::size_t bytes_transferred) {
+      auto bytes_pretransferred = session->request->streambuf->size();
+      asio::async_read_until(*session->connection->socket, *session->request->streambuf, "\r\n\r\n", [this, session, bytes_pretransferred](const error_code &ec, std::size_t bytes_transferred) {
         auto lock = session->connection->handler_runner->continue_lock();
         if(!lock)
           return;
@@ -597,7 +605,7 @@ namespace SimpleWeb {
           // "After a successful async_read_until operation, the streambuf may contain additional data beyond the delimiter"
           // The chosen solution is to extract lines from the stream directly when parsing the header. What is left of the
           // streambuf (maybe some bytes of the content) is appended to in the async_read-function below (for retrieving content).
-          std::size_t num_additional_bytes = session->request->streambuf->size() - bytes_transferred;
+          std::size_t num_additional_bytes = session->request->streambuf->size() - bytes_transferred - bytes_pretransferred;
 
           std::istream istream(session->request->streambuf.get());
           if(!RequestMessage::parse(istream, session->request->method, session->request->path,
